@@ -1,69 +1,69 @@
-# Event Queue Service
+# Сервис очереди событий (Event Queue Service)
 
-Lightweight webhook ingestion service with an in-process persistent task queue and exponential backoff retries. Built with Flask and SQLite.
+Сервис для надёжного приёма вебхуков с очередью отложенных задач на SQLite и экспоненциальным backoff для повторных попыток. Реализован на Flask без внешних брокеров сообщений.
 
-## Architecture
+## Архитектура и ключевые решения
 
-1. **Idempotent Ingestion (`POST /webhook`)**:
-   - `events.event_id` is constrained with a `UNIQUE` index.
-   - Event creation and initial task queuing run in a single transaction.
-   - Duplicate `event_id` submissions immediately short-circuit with `200 OK` without creating duplicate jobs.
+1. **Гарантия идемпотентности (`POST /webhook`)**:
+   - На колонку `events.event_id` установлен уникальный индекс (`UNIQUE`).
+   - Сохранение события и постановка задачи в очередь выполняются в рамках единой транзакции базы данных.
+   - При повторной отправке того же `event_id` запрос безопасно завершается со статусом `200 OK`, предотвращая дублирование задач в очереди.
 
-2. **Task Queue & Background Worker**:
-   - Tasks are stored in SQLite (`tasks` table) and processed by an autonomous background worker thread.
-   - Safe concurrent execution between Flask request handlers and worker threads is coordinated via reentrant thread synchronization (`threading.RLock`) and database transaction isolation.
+2. **Очередь задач и фоновый воркер**:
+   - Очередь хранится в таблице `tasks` и обрабатывается автономным потоком `BackgroundWorker`.
+   - Потокобезопасность при конкурентном доступе между обработчиками Flask и потоком воркера обеспечивается рекурсивным мьютексом (`threading.RLock`) и транзакционной изоляцией SQLite.
 
-3. **Retry Strategy & Backoff**:
-   - Failing tasks are retried up to 3 times with exponential backoff:
-     - 1st retry: 1s delay
-     - 2nd retry: 2s delay
-     - 3rd retry: 4s delay
-   - Tasks failing after 3 attempts transition to `failed` with captured error details.
+3. **Стратегия ретраев (Exponential Backoff)**:
+   - В случае ошибки обработчика задача переводится на повторную попытку с нарастающей задержкой:
+     - 1-я попытка: пауза 1 сек.
+     - 2-я попытка: пауза 2 сек.
+     - 3-я попытка: пауза 4 сек.
+   - После 3 неудачных попыток задача помечается статусом `failed` с сохранением трассировки последней ошибки.
 
 ---
 
-## Quickstart
+## Быстрый старт
 
-### 1. Installation
+### 1. Установка зависимостей
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Run the Service
+### 2. Запуск сервиса
 ```bash
 python app.py
 ```
-Starts the HTTP server on `http://127.0.0.1:5000` with the background worker automatically running.
+Сервис поднимется на `http://127.0.0.1:5000`. При запуске автоматически создаются необходимые таблицы в SQLite и стартует фоновый воркер.
 
 ---
 
-## API Reference
+## Примеры использования API
 
-### Ingest Event
+### Отправка вебхука
 ```bash
 curl -X POST http://127.0.0.1:5000/webhook \
   -H "Content-Type: application/json" \
   -d '{
     "event_id": "tx_98765",
     "type": "payment_succeeded",
-    "payload": {"amount": 1000, "currency": "USD"}
+    "payload": {"amount": 1000, "currency": "RUB"}
   }'
 ```
 
-Response (`200 OK`):
+Ответ (`200 OK`):
 ```json
 {
   "status": "ok",
-  "message": "Event queued successfully"
+  "message": "Событие принято и отправлено в очередь"
 }
 ```
 
-### Metrics & Status
+### Получение статистики
 ```bash
 curl http://127.0.0.1:5000/stats
 ```
 
-Response (`200 OK`):
+Ответ (`200 OK`):
 ```json
 {
   "events_by_type": {
@@ -80,14 +80,15 @@ Response (`200 OK`):
 
 ---
 
-## Running Tests
+## Запуск тестов
 
 ```bash
 pytest test_app.py -v
 ```
 
-Test coverage covers:
-- Idempotency guarantees under identical `event_id` deliveries.
-- Input validation (missing fields, bad types, empty strings).
-- Exponential backoff timings and retry exhaustion (transitioning to `failed`).
-- Accurate event and task counter aggregation on `/stats`.
+Тестовый набор проверяет:
+- Соблюдение идемпотентности при дублирующих `event_id`.
+- Валидацию входных данных (пустые поля, невалидный JSON, некорректные типы).
+- Точность пауз экспоненциального бэкоффа и перевод в `failed` после исчерпания попыток.
+- Корректность агрегации счётчиков на эндпоинте `/stats`.
+- Защиту задач от зависания в статусе `pending` при падении обработчика.

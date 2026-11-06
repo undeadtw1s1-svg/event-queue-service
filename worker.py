@@ -13,23 +13,18 @@ def default_process_handler(event_type: str, payload: dict) -> None:
     if event_type == "payment_succeeded":
         if not payload.get("disable_random_fail") and random.random() < 0.15:
             raise ConnectionError("Gateway timeout")
-        time.sleep(0.01)
-    elif event_type == "user_registered":
-        time.sleep(0.01)
     elif event_type == "skip_test":
         return
-    else:
-        time.sleep(0.01)
+
+    time.sleep(0.01)
 
 
 def get_backoff_delay(attempts: int) -> float:
-    return float(2 ** (attempts - 1))
+    return float(1 << (attempts - 1))
 
 
 def process_one_task(db_path: str = "app.db", handler: Optional[Callable[[str, dict], None]] = None) -> Optional[Dict[str, Any]]:
-    if handler is None:
-        handler = default_process_handler
-
+    fn = handler or default_process_handler
     now = time.time()
 
     with db_lock:
@@ -38,7 +33,7 @@ def process_one_task(db_path: str = "app.db", handler: Optional[Callable[[str, d
 
         cur.execute(
             """
-            SELECT t.id, t.event_id, t.event_type, t.attempts, t.status, e.payload
+            SELECT t.id, t.event_id, t.event_type, t.attempts, e.payload
             FROM tasks t
             JOIN events e ON t.event_id = e.event_id
             WHERE t.status = 'pending' AND t.next_retry_at <= ?
@@ -47,36 +42,31 @@ def process_one_task(db_path: str = "app.db", handler: Optional[Callable[[str, d
             """,
             (now,),
         )
-        task = cur.fetchone()
-        if not task:
+        row = cur.fetchone()
+        if not row:
             conn.close()
             return None
 
-        task_id = task["id"]
-        event_id = task["event_id"]
-        event_type = task["event_type"]
-        attempts = task["attempts"] + 1
-        payload = json.loads(task["payload"])
+        task_id = row["id"]
+        eid = row["event_id"]
+        etype = row["event_type"]
+        attempts = row["attempts"] + 1
+        payload = json.loads(row["payload"])
 
-        try:
-            if event_type == "skip_test":
-                new_status = "skipped"
-                last_error = None
-                next_retry = now
-            else:
-                handler(event_type, payload)
-                new_status = "success"
-                last_error = None
-                next_retry = now
-        except BaseException as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            if attempts >= 3:
-                new_status = "failed"
-                next_retry = now
-            else:
-                delay = get_backoff_delay(attempts)
-                new_status = "pending"
-                next_retry = now + delay
+        err_msg = None
+        if etype == "skip_test":
+            state, retry_ts = "skipped", now
+        else:
+            try:
+                fn(etype, payload)
+                state, retry_ts = "success", now
+            except BaseException as exc:
+                err_msg = f"{exc.__class__.__name__}: {exc}"
+                if attempts >= 3:
+                    state, retry_ts = "failed", now
+                else:
+                    state = "pending"
+                    retry_ts = now + get_backoff_delay(attempts)
 
         cur.execute(
             """
@@ -84,18 +74,18 @@ def process_one_task(db_path: str = "app.db", handler: Optional[Callable[[str, d
             SET status = ?, attempts = ?, next_retry_at = ?, last_error = ?, updated_at = ?
             WHERE id = ?
             """,
-            (new_status, attempts, next_retry, last_error, time.time(), task_id),
+            (state, attempts, retry_ts, err_msg, time.time(), task_id),
         )
         conn.commit()
         conn.close()
 
         return {
             "id": task_id,
-            "event_id": event_id,
-            "event_type": event_type,
+            "event_id": eid,
+            "event_type": etype,
             "attempts": attempts,
-            "status": new_status,
-            "error": last_error,
+            "status": state,
+            "error": err_msg,
         }
 
 
@@ -104,26 +94,26 @@ class BackgroundWorker:
         self.db_path = db_path
         self.poll_interval = poll_interval
         self.handler = handler
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._stopper = threading.Event()
+        self._th: Optional[threading.Thread] = None
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
+        if self._th and self._th.is_alive():
             return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="QueueWorkerThread")
-        self._thread.start()
+        self._stopper.clear()
+        self._th = threading.Thread(target=self._worker_loop, daemon=True, name="EventQueueWorker")
+        self._th.start()
 
     def stop(self, timeout: float = 2.0) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
+        self._stopper.set()
+        if self._th:
+            self._th.join(timeout=timeout)
 
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
+    def _worker_loop(self) -> None:
+        while not self._stopper.is_set():
             try:
-                task = process_one_task(db_path=self.db_path, handler=self.handler)
-                if not task:
+                res = process_one_task(self.db_path, self.handler)
+                if not res:
                     time.sleep(self.poll_interval)
             except Exception:
                 time.sleep(self.poll_interval)

@@ -7,15 +7,12 @@ from database import get_connection, db_lock
 
 
 def default_process_handler(event_type: str, payload: dict) -> None:
-    # Для тестов: если передали simulate_fail или специальный тип, роняем обработку
     if payload.get("simulate_fail") or event_type == "test_force_fail":
-        raise RuntimeError(f"Ошибка обработки события {event_type}")
+        raise RuntimeError(f"Processing failed for event: {event_type}")
 
-    # Заглушка под реальную бизнес-логику
     if event_type == "payment_succeeded":
-        # Небольшой рандомный сбой в 15% случаев для симуляции сети
         if not payload.get("disable_random_fail") and random.random() < 0.15:
-            raise ConnectionError("Временный таймаут платежного шлюза")
+            raise ConnectionError("Gateway timeout")
         time.sleep(0.01)
     elif event_type == "user_registered":
         time.sleep(0.01)
@@ -26,7 +23,6 @@ def default_process_handler(event_type: str, payload: dict) -> None:
 
 
 def get_backoff_delay(attempts: int) -> float:
-    # Нарастающая пауза: 1с, 2с, 4с
     return float(2 ** (attempts - 1))
 
 
@@ -40,7 +36,6 @@ def process_one_task(db_path: str = "app.db", handler: Optional[Callable[[str, d
         conn = get_connection(db_path)
         cur = conn.cursor()
 
-        # Забираем одну готовую таску: статус pending и время повтора уже наступило
         cur.execute(
             """
             SELECT t.id, t.event_id, t.event_type, t.attempts, t.status, e.payload
@@ -50,7 +45,7 @@ def process_one_task(db_path: str = "app.db", handler: Optional[Callable[[str, d
             ORDER BY t.id ASC
             LIMIT 1
             """,
-            (now,)
+            (now,),
         )
         task = cur.fetchone()
         if not task:
@@ -76,11 +71,9 @@ def process_one_task(db_path: str = "app.db", handler: Optional[Callable[[str, d
         except BaseException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if attempts >= 3:
-                # Если упало 3 раза — переводим в failed, больше брать не будем
                 new_status = "failed"
                 next_retry = now
             else:
-                # Откладываем следующую попытку
                 delay = get_backoff_delay(attempts)
                 new_status = "pending"
                 next_retry = now + delay
@@ -91,7 +84,7 @@ def process_one_task(db_path: str = "app.db", handler: Optional[Callable[[str, d
             SET status = ?, attempts = ?, next_retry_at = ?, last_error = ?, updated_at = ?
             WHERE id = ?
             """,
-            (new_status, attempts, next_retry, last_error, time.time(), task_id)
+            (new_status, attempts, next_retry, last_error, time.time(), task_id),
         )
         conn.commit()
         conn.close()
@@ -99,37 +92,38 @@ def process_one_task(db_path: str = "app.db", handler: Optional[Callable[[str, d
         return {
             "id": task_id,
             "event_id": event_id,
-            "status": new_status,
+            "event_type": event_type,
             "attempts": attempts,
-            "last_error": last_error
+            "status": new_status,
+            "error": last_error,
         }
 
 
 class BackgroundWorker:
-    def __init__(self, db_path: str = "app.db", poll_interval: float = 0.5):
+    def __init__(self, db_path: str = "app.db", poll_interval: float = 0.2, handler: Optional[Callable[[str, dict], None]] = None):
         self.db_path = db_path
         self.poll_interval = poll_interval
-        self._running = False
+        self.handler = handler
+        self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-    def start(self):
-        if self._running:
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
             return
-        self._running = True
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="QueueWorkerThread")
         self._thread.start()
 
-    def stop(self):
-        self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
 
-    def _run_loop(self):
-        while self._running:
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
             try:
-                res = process_one_task(self.db_path)
-                if not res:
+                task = process_one_task(db_path=self.db_path, handler=self.handler)
+                if not task:
                     time.sleep(self.poll_interval)
-            except Exception as e:
-                print(f"Ошибка воркера: {e}")
+            except Exception:
                 time.sleep(self.poll_interval)
